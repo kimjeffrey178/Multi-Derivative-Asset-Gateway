@@ -8,9 +8,13 @@
 (define-constant ERR_INVALID_ADDRESS (err u106))
 (define-constant ERR_TOKEN_NOT_FOUND (err u107))
 (define-constant ERR_PAUSED (err u108))
+(define-constant ERR_INVALID_FEE (err u109))
+(define-constant MAX_FEE_BASIS_POINTS u1000)
 
 (define-data-var contract-paused bool false)
 (define-data-var next-deposit-id uint u1)
+(define-data-var withdrawal-fee-basis-points uint u50)
+(define-data-var fee-recipient principal CONTRACT_OWNER)
 
 (define-map deposits
   { deposit-id: uint }
@@ -48,6 +52,11 @@
 )
 
 (define-map authorized-oracles principal bool)
+
+(define-map collected-fees
+  { token-contract: (buff 20) }
+  { total-fees: uint }
+)
 
 (define-public (register-token (token-contract (buff 20)) (name (string-ascii 32)) (symbol (string-ascii 10)) (decimals uint))
   (begin
@@ -90,6 +99,52 @@
   (begin
     (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_OWNER_ONLY)
     (ok (var-set contract-paused false))
+  )
+)
+
+(define-public (set-withdrawal-fee (fee-basis-points uint))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_OWNER_ONLY)
+    (asserts! (<= fee-basis-points MAX_FEE_BASIS_POINTS) ERR_INVALID_FEE)
+    (ok (var-set withdrawal-fee-basis-points fee-basis-points))
+  )
+)
+
+(define-public (set-fee-recipient (recipient principal))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_OWNER_ONLY)
+    (ok (var-set fee-recipient recipient))
+  )
+)
+
+(define-public (withdraw-collected-fees (token-contract (buff 20)))
+  (let (
+    (fees-data (default-to { total-fees: u0 } (map-get? collected-fees { token-contract: token-contract })))
+    (total-fees (get total-fees fees-data))
+    (recipient (var-get fee-recipient))
+    (recipient-balance (default-to u0 (get balance (map-get? user-balances { user: recipient, token-contract: token-contract }))))
+  )
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_OWNER_ONLY)
+    (asserts! (> total-fees u0) ERR_INVALID_AMOUNT)
+    
+    (map-set user-balances
+      { user: recipient, token-contract: token-contract }
+      { balance: (+ recipient-balance total-fees) }
+    )
+    
+    (map-set collected-fees
+      { token-contract: token-contract }
+      { total-fees: u0 }
+    )
+    
+    (print { 
+      action: "withdraw-fees",
+      token-contract: token-contract,
+      amount: total-fees,
+      recipient: recipient
+    })
+    
+    (ok total-fees)
   )
 )
 
@@ -180,6 +235,10 @@
   (let (
     (user-balance (default-to u0 (get balance (map-get? user-balances { user: tx-sender, token-contract: token-contract }))))
     (token-data (unwrap! (map-get? token-info { token-contract: token-contract }) ERR_TOKEN_NOT_FOUND))
+    (fee-bps (var-get withdrawal-fee-basis-points))
+    (fee-amount (/ (* amount fee-bps) u10000))
+    (net-amount (- amount fee-amount))
+    (current-fees (default-to u0 (get total-fees (map-get? collected-fees { token-contract: token-contract }))))
   )
     (asserts! (not (var-get contract-paused)) ERR_PAUSED)
     (asserts! (> amount u0) ERR_INVALID_AMOUNT)
@@ -189,6 +248,11 @@
     (map-set user-balances
       { user: tx-sender, token-contract: token-contract }
       { balance: (- user-balance amount) }
+    )
+    
+    (map-set collected-fees
+      { token-contract: token-contract }
+      { total-fees: (+ current-fees fee-amount) }
     )
     
     (map-set token-info
@@ -201,6 +265,8 @@
       user: tx-sender,
       token-contract: token-contract,
       amount: amount,
+      fee-amount: fee-amount,
+      net-amount: net-amount,
       eth-recipient: eth-recipient,
       burn-block: block-height
     })
@@ -267,10 +333,32 @@
   (default-to false (map-get? authorized-oracles oracle))
 )
 
+(define-read-only (get-withdrawal-fee)
+  (var-get withdrawal-fee-basis-points)
+)
+
+(define-read-only (get-fee-recipient)
+  (var-get fee-recipient)
+)
+
+(define-read-only (get-collected-fees (token-contract (buff 20)))
+  (default-to u0 (get total-fees (map-get? collected-fees { token-contract: token-contract })))
+)
+
+(define-read-only (calculate-withdrawal-fee (amount uint))
+  (let (
+    (fee-bps (var-get withdrawal-fee-basis-points))
+  )
+    (/ (* amount fee-bps) u10000)
+  )
+)
+
 (define-read-only (get-contract-info)
   {
     owner: CONTRACT_OWNER,
     paused: (var-get contract-paused),
-    next-deposit-id: (var-get next-deposit-id)
+    next-deposit-id: (var-get next-deposit-id),
+    withdrawal-fee-bps: (var-get withdrawal-fee-basis-points),
+    fee-recipient: (var-get fee-recipient)
   }
 )
