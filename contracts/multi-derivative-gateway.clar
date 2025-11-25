@@ -9,12 +9,17 @@
 (define-constant ERR_TOKEN_NOT_FOUND (err u107))
 (define-constant ERR_PAUSED (err u108))
 (define-constant ERR_INVALID_FEE (err u109))
+(define-constant ERR_WITHDRAWAL_LOCKED (err u110))
+(define-constant ERR_WITHDRAWAL_NOT_FOUND (err u111))
 (define-constant MAX_FEE_BASIS_POINTS u1000)
+(define-constant DEFAULT_TIMELOCK_BLOCKS u144)
 
 (define-data-var contract-paused bool false)
 (define-data-var next-deposit-id uint u1)
+(define-data-var next-withdrawal-id uint u1)
 (define-data-var withdrawal-fee-basis-points uint u50)
 (define-data-var fee-recipient principal CONTRACT_OWNER)
+(define-data-var withdrawal-timelock-blocks uint DEFAULT_TIMELOCK_BLOCKS)
 
 (define-map deposits
   { deposit-id: uint }
@@ -56,6 +61,25 @@
 (define-map collected-fees
   { token-contract: (buff 20) }
   { total-fees: uint }
+)
+
+(define-map withdrawal-queue
+  { withdrawal-id: uint }
+  {
+    user: principal,
+    token-contract: (buff 20),
+    amount: uint,
+    eth-recipient: (buff 20),
+    request-block: uint,
+    unlock-block: uint,
+    is-cancelled: bool,
+    is-finalized: bool
+  }
+)
+
+(define-map user-withdrawals
+  { user: principal, token-contract: (buff 20) }
+  { withdrawal-ids: (list 100 uint) }
 )
 
 (define-public (register-token (token-contract (buff 20)) (name (string-ascii 32)) (symbol (string-ascii 10)) (decimals uint))
@@ -114,6 +138,13 @@
   (begin
     (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_OWNER_ONLY)
     (ok (var-set fee-recipient recipient))
+  )
+)
+
+(define-public (set-withdrawal-timelock (blocks uint))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_OWNER_ONLY)
+    (ok (var-set withdrawal-timelock-blocks blocks))
   )
 )
 
@@ -223,6 +254,140 @@
       action: "mint",
       deposit-id: deposit-id,
       recipient: recipient,
+      token-contract: token-contract,
+      amount: amount
+    })
+    
+    (ok true)
+  )
+)
+
+(define-public (request-withdrawal (token-contract (buff 20)) (amount uint) (eth-recipient (buff 20)))
+  (let (
+    (user-balance (default-to u0 (get balance (map-get? user-balances { user: tx-sender, token-contract: token-contract }))))
+    (token-data (unwrap! (map-get? token-info { token-contract: token-contract }) ERR_TOKEN_NOT_FOUND))
+    (withdrawal-id (var-get next-withdrawal-id))
+    (timelock-blocks (var-get withdrawal-timelock-blocks))
+    (unlock-block (+ block-height timelock-blocks))
+    (user-withdrawal-list (default-to (list) (get withdrawal-ids (map-get? user-withdrawals { user: tx-sender, token-contract: token-contract }))))
+  )
+    (asserts! (not (var-get contract-paused)) ERR_PAUSED)
+    (asserts! (> amount u0) ERR_INVALID_AMOUNT)
+    (asserts! (>= user-balance amount) ERR_INSUFFICIENT_BALANCE)
+    (asserts! (get is-active token-data) ERR_TOKEN_NOT_FOUND)
+    
+    (map-set user-balances
+      { user: tx-sender, token-contract: token-contract }
+      { balance: (- user-balance amount) }
+    )
+    
+    (map-set withdrawal-queue
+      { withdrawal-id: withdrawal-id }
+      {
+        user: tx-sender,
+        token-contract: token-contract,
+        amount: amount,
+        eth-recipient: eth-recipient,
+        request-block: block-height,
+        unlock-block: unlock-block,
+        is-cancelled: false,
+        is-finalized: false
+      }
+    )
+    
+    (map-set user-withdrawals
+      { user: tx-sender, token-contract: token-contract }
+      { withdrawal-ids: (unwrap-panic (as-max-len? (append user-withdrawal-list withdrawal-id) u100)) }
+    )
+    
+    (var-set next-withdrawal-id (+ withdrawal-id u1))
+    
+    (print { 
+      action: "withdrawal-requested",
+      withdrawal-id: withdrawal-id,
+      user: tx-sender,
+      token-contract: token-contract,
+      amount: amount,
+      eth-recipient: eth-recipient,
+      unlock-block: unlock-block
+    })
+    
+    (ok withdrawal-id)
+  )
+)
+
+(define-public (finalize-withdrawal (withdrawal-id uint))
+  (let (
+    (withdrawal-data (unwrap! (map-get? withdrawal-queue { withdrawal-id: withdrawal-id }) ERR_WITHDRAWAL_NOT_FOUND))
+    (token-contract (get token-contract withdrawal-data))
+    (amount (get amount withdrawal-data))
+    (token-data (unwrap! (map-get? token-info { token-contract: token-contract }) ERR_TOKEN_NOT_FOUND))
+    (fee-bps (var-get withdrawal-fee-basis-points))
+    (fee-amount (/ (* amount fee-bps) u10000))
+    (net-amount (- amount fee-amount))
+    (current-fees (default-to u0 (get total-fees (map-get? collected-fees { token-contract: token-contract }))))
+  )
+    (asserts! (not (var-get contract-paused)) ERR_PAUSED)
+    (asserts! (is-eq tx-sender (get user withdrawal-data)) ERR_NOT_AUTHORIZED)
+    (asserts! (not (get is-cancelled withdrawal-data)) ERR_WITHDRAWAL_NOT_FOUND)
+    (asserts! (not (get is-finalized withdrawal-data)) ERR_ALREADY_MINTED)
+    (asserts! (>= block-height (get unlock-block withdrawal-data)) ERR_WITHDRAWAL_LOCKED)
+    
+    (map-set collected-fees
+      { token-contract: token-contract }
+      { total-fees: (+ current-fees fee-amount) }
+    )
+    
+    (map-set token-info
+      { token-contract: token-contract }
+      (merge token-data { total-supply: (- (get total-supply token-data) amount) })
+    )
+    
+    (map-set withdrawal-queue
+      { withdrawal-id: withdrawal-id }
+      (merge withdrawal-data { is-finalized: true })
+    )
+    
+    (print { 
+      action: "withdrawal-finalized",
+      withdrawal-id: withdrawal-id,
+      user: tx-sender,
+      token-contract: token-contract,
+      amount: amount,
+      fee-amount: fee-amount,
+      net-amount: net-amount,
+      eth-recipient: (get eth-recipient withdrawal-data)
+    })
+    
+    (ok true)
+  )
+)
+
+(define-public (cancel-withdrawal (withdrawal-id uint))
+  (let (
+    (withdrawal-data (unwrap! (map-get? withdrawal-queue { withdrawal-id: withdrawal-id }) ERR_WITHDRAWAL_NOT_FOUND))
+    (token-contract (get token-contract withdrawal-data))
+    (amount (get amount withdrawal-data))
+    (user-balance (default-to u0 (get balance (map-get? user-balances { user: tx-sender, token-contract: token-contract }))))
+  )
+    (asserts! (is-eq tx-sender (get user withdrawal-data)) ERR_NOT_AUTHORIZED)
+    (asserts! (not (get is-cancelled withdrawal-data)) ERR_WITHDRAWAL_NOT_FOUND)
+    (asserts! (not (get is-finalized withdrawal-data)) ERR_ALREADY_MINTED)
+    
+    (map-set user-balances
+      { user: tx-sender, token-contract: token-contract }
+      { balance: (+ user-balance amount) }
+    )
+    
+    (map-set withdrawal-queue
+      { withdrawal-id: withdrawal-id }
+      (merge withdrawal-data { is-cancelled: true })
+    )
+    
+    (print { 
+      action: "withdrawal-cancelled",
+      withdrawal-id: withdrawal-id,
+      user: tx-sender,
       token-contract: token-contract,
       amount: amount
     })
@@ -353,12 +518,26 @@
   )
 )
 
+(define-read-only (get-withdrawal-info (withdrawal-id uint))
+  (map-get? withdrawal-queue { withdrawal-id: withdrawal-id })
+)
+
+(define-read-only (get-user-withdrawals (user principal) (token-contract (buff 20)))
+  (default-to (list) (get withdrawal-ids (map-get? user-withdrawals { user: user, token-contract: token-contract })))
+)
+
+(define-read-only (get-withdrawal-timelock)
+  (var-get withdrawal-timelock-blocks)
+)
+
 (define-read-only (get-contract-info)
   {
     owner: CONTRACT_OWNER,
     paused: (var-get contract-paused),
     next-deposit-id: (var-get next-deposit-id),
+    next-withdrawal-id: (var-get next-withdrawal-id),
     withdrawal-fee-bps: (var-get withdrawal-fee-basis-points),
-    fee-recipient: (var-get fee-recipient)
+    fee-recipient: (var-get fee-recipient),
+    withdrawal-timelock-blocks: (var-get withdrawal-timelock-blocks)
   }
 )
